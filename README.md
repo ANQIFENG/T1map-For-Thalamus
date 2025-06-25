@@ -1,4 +1,4 @@
-# T1map-for-Thalamus
+# 🧠 T1map-for-Thalamus 🧠
 
 This repository contains the source code for the paper:  
 **"Segmenting Thalamic Nuclei: T1 Maps Provide a Reliable and Efficient Solution"**.
