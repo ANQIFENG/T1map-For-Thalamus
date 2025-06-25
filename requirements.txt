@@ -1,0 +1,12 @@
+numpy
+scipy
+matplotlib
+pandas
+torch
+torchvision
+torchaudio
+nibabel
+tqdm
+scikit-image
+radifox
+statsmodels

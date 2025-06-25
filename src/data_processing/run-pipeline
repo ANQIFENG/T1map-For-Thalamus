@@ -1,0 +1,308 @@
+#!/usr/bin/env python
+
+import argparse
+import logging
+import os
+import glob
+import shutil
+from pathlib import Path
+from radifox.records import ProcessingModule
+
+
+import sys
+sys.path.append('/opt/run')
+from run_hdbet import run_hdbet
+from change_img_dtype import change_image_dtype
+from run_subject_registration import register_mprage_to_mni
+from run_image_registration import register_fgatir_to_mprage
+from apply_reference_min import apply_reference_min
+from run_n4_bias_field_correction import bias_correction
+from calculate_harmonic_bias import calculate_harmonic_bias
+from generate_bgmask import create_bg_mask
+from run_fcm_normalize import run_fcm_normalize
+from white_matter_norm import wm_norm
+from pd_t1_calc import calculate_pd_t1_map
+from multi_Ti_calc import synthesize_multi_ti_images
+
+
+class ProcessingPipeline(ProcessingModule):
+
+    name = "images-processing-pipeline"
+    version = "1.0.0"
+
+    @staticmethod
+    def cli(args=None):
+        parser = argparse.ArgumentParser(description='Generating Multi-TI images from MPRAGE and FGATIR images.')
+        parser.add_argument('--mprage', type=Path, required=True, help='Path to the MPRAGE image.')
+        parser.add_argument('--fgatir', type=Path, required=True, help='Path to the FGATIR image.')
+        parser.add_argument('--out_dir', type=str, required=True, help='Directory to save the output Nifti files.')
+        parser.add_argument('--tr', type=float, required=True, help='Repetition time (TR) for both MPRAGE and FGATIR images.')
+        parser.add_argument('--ti_mprage', type=float, required=True, help='Inversion time (TI) for MPRAGE image.')
+        parser.add_argument('--ti_fgatir', type=float, required=True, help='Inversion time (TI) for FGATIR image.')
+        parser.add_argument('--ti_min', type=float, default=400.0, help='Minimum inversion time for synthesizing Multi-TI images.')
+        parser.add_argument('--ti_max', type=float, default=1400.0, help='Maximum inversion time for synthesizing Multi-TI images.')
+        parser.add_argument('--ti_step', type=float, default=20.0, help='Step size for inversion times between ti_min and ti_max.')
+        parser.add_argument('--num_workers', type=int, default=8, help='Number of workers to use for parallel processing.')
+        parser.add_argument('--save_intermediate', action='store_true', default=False, help='Flag to save intermediate results.')
+        parsed = parser.parse_args(args)
+
+        # Check required file paths and existence
+        if not parsed.mprage:
+            parser.error("The --mprage argument is required.")
+        elif not parsed.mprage.exists():
+            parser.error(f"The MPRAGE file at {parsed.mprage} does not exist.")
+
+        if not parsed.fgatir:
+            parser.error("The --fgatir argument is required.")
+        elif not parsed.fgatir.exists():
+            parser.error(f"The FGATIR file at {parsed.fgatir} does not exist.")
+
+        if not parsed.tr:
+            parser.error("The --tr argument is required.")
+
+        if not parsed.ti_mprage:
+            parser.error("The --ti_mprage argument is required.")
+
+        if not parsed.ti_fgatir:
+            parser.error("The --ti_fgatir argument is required.")
+
+        print(f"Using MPRAGE image: {parsed.mprage}")
+        print(f"Using FGATIR image: {parsed.fgatir}")
+        print(f"Output directory: {parsed.out_dir}")
+        print(f"Using value for TR: {parsed.tr}")
+        print(f"Using value for TI MPRAGE: {parsed.ti_mprage}")
+        print(f"Using value for TI FGATIR: {parsed.ti_fgatir}")
+        print(f"Using value for TI MIN: {parsed.ti_min}")
+        print(f"Using value for TI MAX: {parsed.ti_max}")
+        print(f"Using value for TI STEP: {parsed.ti_step}")
+        print(f"Using value for number of workers: {parsed.num_workers}")
+        print(f"Save intermediate results: {parsed.save_intermediate}")
+
+        return {
+            "mprage": parsed.mprage,
+            "fgatir": parsed.fgatir,
+            "out_dir": parsed.out_dir,
+            "tr": parsed.tr,
+            "ti_mprage": parsed.ti_mprage,
+            "ti_fgatir": parsed.ti_fgatir,
+            "ti_min": parsed.ti_min,
+            "ti_max": parsed.ti_max,
+            "ti_step": parsed.ti_step,
+            "num_workers": parsed.num_workers,
+            "save_intermediate": parsed.save_intermediate,
+        }
+
+    @staticmethod
+    def run(mprage: Path, fgatir: Path, out_dir: str, tr: float, ti_mprage: float, ti_fgatir: float, ti_min: float, ti_max: float, ti_step: float, num_workers: int, save_intermediate: bool):
+
+        # Convert paths to absolute paths
+        mprage = str(mprage.resolve())
+        fgatir = str(fgatir.resolve())
+
+        # Create output directory
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Create proc directory
+        proc_dir = os.path.join(out_dir, 'proc')
+        os.makedirs(proc_dir, exist_ok=True)
+
+        # Create temporary directory
+        tmp_dir = os.path.join(out_dir, 'tmp')
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        # Copy and rename MPRAGE and FGATIR
+        mprage_tmp = os.path.join(tmp_dir, 't1_mprage.nii.gz')
+        fgatir_tmp = os.path.join(tmp_dir, 't1_fgatir.nii.gz')
+        shutil.copy(mprage, mprage_tmp)
+        shutil.copy(fgatir, fgatir_tmp)
+
+        # Start running processing pipeline
+        logging.info("Start Processing.......")
+
+        # Step 1
+        logging.info("Running HD-BET for brain extraction...")
+        hdbet_out_fp = mprage_tmp.replace('.nii.gz', '_brain.nii.gz')
+        run_hdbet(mprage_tmp, hdbet_out_fp)
+
+        # Step 2
+        logging.info("Changing image dtype to float32...")
+        mprage_float32_out_fp = mprage_tmp.replace('.nii.gz', '_float32.nii.gz')
+        fgatir_float32_out_fp = fgatir_tmp.replace('.nii.gz', '_float32.nii.gz')
+        change_image_dtype(mprage_tmp, mprage_float32_out_fp)
+        change_image_dtype(fgatir_tmp, fgatir_float32_out_fp)
+
+        # Step 3
+        logging.info("Registering MPRAGE to MNI space...")
+        mprage_float32 = os.path.join(tmp_dir, 't1_mprage_float32.nii.gz')
+        register_mprage_to_mni(mprage_float32, atlas_dir="/opt/atlas", output_dir=tmp_dir)
+
+        logging.info("Registering FGATIR to registered MPRAGE...")
+        fgatir_float32 = os.path.join(tmp_dir, 't1_fgatir_float32.nii.gz')
+        hdbet_brain_mask = os.path.join(tmp_dir, 't1_mprage_brain_mask.nii.gz')
+        mprage_regi = os.path.join(tmp_dir, 't1_mprage_float32_reg.nii.gz')
+        mprage_transform = os.path.join(tmp_dir, 't1_mprage_float32_reg.mat')
+        register_fgatir_to_mprage(mprage_float32, fgatir_float32, hdbet_brain_mask,
+                                  mprage_regi, mprage_transform, output_dir=tmp_dir)
+
+        # Step 4
+        logging.info("Applying original minimum value to registered images ...")
+        mprage_regi = os.path.join(tmp_dir, 't1_mprage_float32_reg.nii.gz')
+        mprage_float32 = os.path.join(tmp_dir, 't1_mprage_float32.nii.gz')
+        mprage_thre_out_fp = mprage_regi.replace('.nii.gz', '_thre.nii.gz')
+
+        fgatir_regi = os.path.join(tmp_dir, 't1_fgatir_float32_reg.nii.gz')
+        fgatir_float32 = os.path.join(tmp_dir, 't1_fgatir_float32.nii.gz')
+        fgatir_thre_out_fp = fgatir_regi.replace('.nii.gz', '_thre.nii.gz')
+
+        apply_reference_min(mprage_regi, mprage_float32, mprage_thre_out_fp)
+        apply_reference_min(fgatir_regi, fgatir_float32, fgatir_thre_out_fp)
+
+        # Step 5
+        logging.info("Calculating bias field ...")
+        mprage_thre = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre.nii.gz')
+        fgatir_thre = os.path.join(tmp_dir, 't1_fgatir_float32_reg_thre.nii.gz')
+        bias_correction(mprage_thre, out_dir=tmp_dir)
+        bias_correction(fgatir_thre, out_dir=tmp_dir)
+
+        logging.info("Calculating harmonic bias field and performing correction ...")
+        mprage_bias = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_bias.nii.gz')
+        fgatir_bias = os.path.join(tmp_dir, 't1_fgatir_float32_reg_thre_bias.nii.gz')
+        harmonic_bias_out_fp = mprage_bias.replace('.nii.gz', '_sqrt.nii.gz')
+        mprage_n4sqrt_out_fp = mprage_thre.replace('.nii.gz', '_n4sqrt.nii.gz')
+        fgatir_n4sqrt_out_fp = fgatir_thre.replace('.nii.gz', '_n4sqrt.nii.gz')
+
+        calculate_harmonic_bias(mprage_thre, fgatir_thre, mprage_bias, fgatir_bias,
+                                harmonic_bias_out_fp, mprage_n4sqrt_out_fp, fgatir_n4sqrt_out_fp)
+
+        # Step 6
+        logging.info("Running HD-BET on registered data for brain extraction...")
+        mprage_n4sqrt = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt.nii.gz')
+        hdbet_regi_out_fp = mprage_n4sqrt.replace('.nii.gz', '_brain.nii.gz')
+        run_hdbet(mprage_n4sqrt, hdbet_regi_out_fp)
+
+        # Step 7
+        logging.info("Extracting background mask...")
+        mprage_n4sqrt = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt.nii.gz')
+        bg_mask_out_fp = mprage_n4sqrt.replace('.nii.gz', '_bgmask.nii.gz')
+        create_bg_mask(mprage_n4sqrt, bg_mask_out_fp)
+
+        # Step 8
+        logging.info("Calculating white matter mask...")
+        mprage_n4sqrt = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt.nii.gz')
+        hdbet_brain_regi_mask = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt_brain_mask.nii.gz')
+        mprage_norm_out_fp = mprage_n4sqrt.replace('.nii.gz', '_mprage_norm.nii.gz')
+        run_fcm_normalize(mprage_n4sqrt, hdbet_brain_regi_mask, mprage_norm_out_fp)
+
+        logging.info("Performing white matter mean normalization...")
+        fgatir_n4sqrt = os.path.join(tmp_dir, 't1_fgatir_float32_reg_thre_n4sqrt.nii.gz')
+        wm_membership = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt_wm_membership.nii.gz')
+        mprage_wmn_out_fp = mprage_n4sqrt.replace('.nii.gz', '_wmn.nii.gz')
+        fgatir_wmn_out_fp = fgatir_n4sqrt.replace('.nii.gz', '_wmn.nii.gz')
+        wm_mask_out_fp = wm_membership.replace('wm_membership.nii.gz', 'wm_mask.nii.gz')
+
+        wm_norm(mprage_n4sqrt, fgatir_n4sqrt, wm_membership,
+                mprage_wmn_out_fp, fgatir_wmn_out_fp, wm_mask_out_fp)
+
+        # Step 9
+        logging.info("Calculating PD map and T1 map..")
+        mprage_wmn = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt_wmn.nii.gz')
+        fgatir_wmn = os.path.join(tmp_dir, 't1_fgatir_float32_reg_thre_n4sqrt_wmn.nii.gz')
+        bg_mask = os.path.join(tmp_dir, 't1_mprage_float32_reg_thre_n4sqrt_bgmask.nii.gz')
+        pd_out_fp = os.path.join(tmp_dir, 'pd_map.nii.gz')
+        t1_out_fp = os.path.join(tmp_dir, 't1_map.nii.gz')
+
+        calculate_pd_t1_map(mprage_wmn, fgatir_wmn, bg_mask,
+                            ti_mprage, ti_fgatir, tr,
+                            mprage_isflip=1, fgatir_isflip=-1,
+                            pd_out_path=pd_out_fp, t1_out_path=t1_out_fp, num_workers=num_workers)
+        
+        # Step 10
+        logging.info("Synthesizing Multi-TI images..")
+        pd_map = os.path.join(tmp_dir, 'pd_map.nii.gz')
+        t1_map = os.path.join(tmp_dir, 't1_map.nii.gz')
+
+        multi_ti_dir = os.path.join(tmp_dir, 'multi-ti')
+        os.makedirs(multi_ti_dir, exist_ok=True)
+                              
+        synthesize_multi_ti_images(ti_min, ti_max, ti_step, tr, t1_map, pd_map, multi_ti_dir)
+
+        # Copy necessary output files from tmp_dir to out_dir
+        patterns = [
+            '*_reg_thre.nii.gz',
+            '*_reg.mat',
+            '*_bias.nii.gz',
+            '*_bias_sqrt.nii.gz',
+            '*_n4sqrt.nii.gz',
+            '*_n4sqrt_brain_mask.nii.gz',
+            '*_bgmask.nii.gz',
+            '*_wm_mask.nii.gz',
+            '*_wmn.nii.gz',
+            'pd_map.nii.gz',
+            't1_map.nii.gz'
+            ]
+        for pattern in patterns:
+            matching_files = glob.glob(os.path.join(tmp_dir, pattern))
+            for src_file in matching_files:
+                file_name = os.path.basename(src_file)
+                dest_file = os.path.join(proc_dir, file_name)
+                if os.path.exists(src_file):
+                    shutil.copy(src_file, dest_file)
+                    logging.info(f"Copied {src_file} to {dest_file}")
+
+        # Copy multi-ti directory
+        src_dir = os.path.join(tmp_dir, 'multi-ti/')
+        dest_dir = os.path.join(proc_dir, 'multi-ti/')
+        if os.path.exists(src_dir):
+            shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
+            logging.info(f"Copied {src_dir} to {dest_dir}")
+
+        multi_ti_files = list(Path(dest_dir).glob('*'))
+
+        # Delete temporary directory if not saving intermediate results
+        if not save_intermediate:
+            shutil.rmtree(tmp_dir)
+            logging.info("Processing completed and temporary files cleaned up.")
+        else:
+            logging.info("Processing completed. Intermediate files saved.")
+
+        # Return Outputs
+        mprage_reg_out = Path(proc_dir) / "t1_mprage_float32_reg_thre.nii.gz"
+        fgatir_reg_out = Path(proc_dir) / "t1_fgatir_float32_reg_thre.nii.gz"
+        mprage_transform_out = Path(proc_dir) / "t1_mprage_float32_reg.mat"
+        fgatir_transform_out = Path(proc_dir) / "t1_fgatir_float32_reg.mat"
+        mprage_n4_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_n4sqrt.nii.gz"
+        fgatir_n4_out = Path(proc_dir) / "t1_fgatir_float32_reg_thre_n4sqrt.nii.gz"
+        mprage_bias_field_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_bias.nii.gz"
+        fgatir_bias_field_out = Path(proc_dir) / "t1_fgatir_float32_reg_thre_bias.nii.gz"
+        harmonic_bias_field_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_bias_sqrt.nii.gz"
+        mprage_wmn_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_n4sqrt_wmn.nii.gz"
+        fgatir_wmn_out = Path(proc_dir) / "t1_fgatir_float32_reg_thre_n4sqrt_wmn.nii.gz"
+        wm_mask_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_n4sqrt_wm_mask.nii.gz"
+        bg_mask_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_n4sqrt_bgmask.nii.gz"
+        brain_mask_out = Path(proc_dir) / "t1_mprage_float32_reg_thre_n4sqrt_brain_mask.nii.gz"
+        t1_map_out = Path(proc_dir) / "t1_map.nii.gz"
+        pd_map_out = Path(proc_dir) / "pd_map.nii.gz"
+
+        return {
+            "mprage_reg": mprage_reg_out,
+            "fgatir_reg": fgatir_reg_out,
+            "mprage_transform": mprage_transform_out,
+            "fgatir_transform": fgatir_transform_out,
+            "mprage_n4": mprage_n4_out,
+            "fgatir_n4": fgatir_n4_out,
+            "mprage_bias_field": mprage_bias_field_out,
+            "fgatir_bias_field": fgatir_bias_field_out,
+            "harmonic_bias_field": harmonic_bias_field_out,
+            "mprage_wmn": mprage_wmn_out,
+            "fgatir_wmn": fgatir_wmn_out,
+            "wm_mask": wm_mask_out,
+            "bg_mask": bg_mask_out,
+            "brain_mask": brain_mask_out,
+            "t1_map": t1_map_out,
+            "pd_map": pd_map_out,
+            "multi-ti_images": multi_ti_files,
+        }
+
+
+if __name__ == '__main__':
+    ProcessingPipeline()
